@@ -253,3 +253,132 @@ content-length: 50
 Upon polling, the Go server would return the above JSON response that includes the job status and
 progress. The HTTP 200 status code indicates that the job is OK and started processing. Please note,
 the status and progress columns are created and developed in the subsequent steps. */
+
+/* ====================================================================================
+STEP 3 - status, progress
+==================================================================================== */
+
+ALTER TABLE music_jobs
+    ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'done', 'failed')),
+    ADD COLUMN progress INTEGER NOT NULL DEFAULT 0
+        CHECK (progress BETWEEN 0 AND 100);
+
+----- Q & A -----
+
+/* 1. Why are status and progress real columns, not inside payload JSONB?
+Storing status and progress as real columns allows for more efficient querying and indexing compared
+to storing them inside the payload JSONB. Real columns can be indexed, which improves performance
+when filtering or sorting based on these fields. In contrast, querying JSONB fields requires
+additional overhead to parse the JSON data, which can lead to slower performance. Additionally,
+having status and progress as separate columns allows for easier updates and maintenance, as they
+can be modified directly without the need to manipulate the JSON structure. */
+
+/* 2. What happens if a buggy worker writes status = 'complet'?
+If a buggy worker writes status = 'complet', the CHECK constraint will prevent the update from
+succeeding, as 'complet' is not one of the allowed values. Therefore, the update will be rejected
+and an error will be returned. */
+
+/* 3. Why does the CHECK constraint matter more than application validation? 
+The CHECK constraint at the database level provides an additional layer of data integrity that is
+enforced regardless of the application logic. This means that even if there is a bug in the application
+that allows invalid data to be generated, the database will still reject it, ensuring that the data
+remains consistent and valid. Relying solely on application validation can lead to situations where
+invalid data is inserted into the database due to bugs or oversights in the application code, which
+can cause issues down the line when querying or processing that data. */
+
+/* 4. Draw the state machine for a job lifecycle
+    
+        +-------+         +----------+      worker claims job     +------------+
+        | START | ------> | PENDING  | -----------------------> | PROCESSING |
+        +-------+         +----------+                           +------------+
+                                                                 |            |
+                                             all stages succeed  |            | stage fails
+                                                                 v            v
+                                                             +------+    +--------+
+                                                             | DONE |    | FAILED |
+                                                             +------+    +--------+
+                                                                 |            |
+                                                                 +-----+------+
+                                                                       |
+                                                                       v
+                                                                    +-----+
+                                                                    | END |
+                                                                    +-----+
+
+Terminal states:
+   DONE
+   FAILED
+
+A job starts in PENDING. Once a worker claims it, the job moves to PROCESSING. From PROCESSING,
+it can move to DONE if all processing stages succeed, or FAILED if any stage fails. START and END
+are used as placeholders to represent a UML state machine diagram's initial and final states
+symbols, respectively. */
+
+----- SAMPLE DATA -----
+
+-- claim the oldest pending job and update its status to processing with 25% progress
+UPDATE music_jobs
+SET status = 'processing', progress = 25
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+-- update the same job to 50% progress
+UPDATE music_jobs
+SET progress = 50
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+-- update the same job's status to done with 100% progress
+UPDATE music_jobs
+SET status = 'done', progress = 100
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+-- attempt an invalid update to the same job's status and progress
+UPDATE music_jobs
+SET status = 'invalid', progress = 110
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+/* ERROR: new row for relation "music_jobs" violates check constraint "music_jobs_status_check",
+   ERROR: new row for relation "music_jobs" violates check constraint "music_jobs_progress_check" */
+
+----- VERIFICATION QUERIES -----
+
+-- update another job's status to processing so that it can be used for the next steps
+UPDATE music_jobs
+SET status = 'processing', progress = 25
+WHERE id = (SELECT id FROM music_jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1);
+
+/* 1. What does the client see when polling a processing job?
+SELECT status, progress FROM music_jobs WHERE public_id = '7f3103a3-b2fe-438a-83ca-dfdbcf8c0674';
+
+   status   | progress 
+------------+----------
+ processing |       25
+(1 row)
+
+The client would see a JSON response similar to the following when polling a processing job:
+
+HTTP/2 200
+date: Fri, 14 May 2026 00:03:47 GMT
+content-length: 50
+{
+    "status": "processing",
+    "progress": 25
+} */
+
+/* 2. What query does the worker run to find its next job?
+SELECT id FROM music_jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1;
+
+                  id                  
+--------------------------------------
+ 019e2887-bd83-7862-9312-4116f23aa216
+(1 row) */
+
+/* 3. Show all jobs with their current state 
+SELECT id, payload->>'title' AS title, status, progress, created_at FROM music_jobs ORDER BY created_at;
+
+                  id                  |       title        |   status   | progress |          created_at           
+--------------------------------------+--------------------+------------+----------+-------------------------------
+ 019e2887-b5a1-78bc-958b-8fdd00a690e1 | Wadani Le          | done       |      100 | 2026-05-14 16:07:23.041211-06
+ 019e2887-b98d-78f8-a533-e8537001f6bc | Good Mawnin Belize | processing |       25 | 2026-05-14 16:07:24.04539-06
+ 019e2887-bd83-7862-9312-4116f23aa216 | Born Deh           | pending    |        0 | 2026-05-14 16:07:25.059356-06
+(3 rows) */
