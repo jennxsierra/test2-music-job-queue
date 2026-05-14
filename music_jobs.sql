@@ -23,6 +23,7 @@ CREATE TABLE music_jobs (
 );
 
 ----- Q & A -----
+
 /* 1. Why UUID over SERIAL for the primary key?
 The UUID data type provides a globally unique identifier that is not tied to a specific sequence
 or server instance, making it ideal for distributed systems and ensuring uniqueness across different
@@ -71,7 +72,7 @@ VALUES (
     }'::JSONB
 );
 
-SELECT pg_sleep(1); -- Utilized to create a time gap between entries for testing purposes
+SELECT pg_sleep(1); -- utilized to create a time gap between entries for testing purposes
 
 INSERT INTO
     music_jobs (payload)
@@ -151,3 +152,104 @@ FROM music_jobs WHERE payload ? 'bitrate';
 --------------------------------------+--------------+---------
  019e2517-17d8-7a06-bb49-d8d0edcdc46c | born_deh.mp3 | 320
 (1 row) */
+
+/* ====================================================================================
+STEP 2 - public_id
+==================================================================================== */
+
+ALTER TABLE music_jobs
+    ADD COLUMN public_id UUID UNIQUE NOT NULL DEFAULT uuidv4();
+
+----- Q & A -----
+
+/* 1. Why does this column use uuidv4() and not uuidv7()?
+The public_id column uses uuidv4() because it is intended to be a unique identifier that is not
+necessarily time-ordered. Since public_id may be exposed to external systems or users, using uuidv4()
+ensures that the IDs are random and do not reveal any information about the order of record creation.
+In contrast, uuidv7() generates time-ordered UUIDs, which may not be suitable for public-facing
+identifiers. This is because they can potentially be analyzed by malicious actors to infer
+information about the system's activity patterns, which can be exploited by a competitor or used to
+time a DDoS attack. */
+
+/* 2. What does uuid_extract_timestamp() reveal about uuidv7?
+The uuid_extract_timestamp() function can be used to extract the timestamp component from a uuidv7()
+UUID. This reveals the exact time when the UUID was generated, which can provide insights into the
+order of record creation and the timing of events in the system. This information can be useful for
+debugging, auditing, or analyzing system performance, but it can also pose a security risk if exposed
+publicly, as discussed in Question 1. */
+
+/* 3. Why does the UNIQUE constraint make CREATE INDEX unnecessary? 
+In PostgreSQL, the UNIQUE constraint on the public_id column automatically creates a unique index on
+that column. This means that the database will enforce uniqueness and optimize queries based on the
+public_id without the need for an additional CREATE INDEX statement. The UNIQUE constraint ensures
+that no two records can have the same public_id, while also providing efficient lookups through the
+underlying index. Therefore, adding a separate CREATE INDEX would be redundant and unnecessary. */
+
+/* 4. What is the two-ID pattern and why does it matter?
+The two-ID pattern refers to the practice of using two different types of identifiers in a database:
+a primary key (id) that is used internally for database operations, and a public identifier
+(public_id) that is exposed to external systems or users. This pattern matters because it allows
+for better security and flexibility. The primary key can be optimized for database performance and
+internal use, while the public identifier can be designed to be more user-friendly and secure for
+external use. By separating these two identifiers, developers can ensure that sensitive information
+about the database structure is not exposed to the public, while still providing a way to reference
+records in a secure and efficient manner. */
+
+----- VERIFICATION QUERIES -----
+
+/* 1. Show id vs public_id side by side - what do you notice?
+SELECT id, public_id FROM music_jobs;
+
+                  id                  |              public_id               
+--------------------------------------+--------------------------------------
+ 019e2536-f793-72b2-9894-c93f65472184 | b31dedca-4c25-471d-8b13-128d77a24681
+ 019e2536-fb7e-77cd-a568-594f75c73e38 | 7f3103a3-b2fe-438a-83ca-dfdbcf8c0674
+ 019e2536-ff76-729e-9315-01539e12c6cf | a60e6cb3-ed14-4a79-a4c1-84be9e6e71ba
+(3 rows)
+
+Upon inspection, you immediately notice that the id values all begin with the same prefix "019e2536",
+which corresponds to the timestamp component of uuidv7() UUIDs. In contrast, the public_id values
+are completely random and do not share any common prefix, which is typical of uuidv4() UUIDs. */
+
+/* 2. Run uuid_extract_timestamp() on both columns - what does this prove?
+SELECT uuid_extract_timestamp(id) AS id_timestamp, uuid_extract_timestamp(public_id) AS public_id_timestamp
+FROM music_jobs;
+
+        id_timestamp        | public_id_timestamp 
+----------------------------+---------------------
+ 2026-05-14 00:40:19.859-06 | 
+ 2026-05-14 00:40:20.862-06 | 
+ 2026-05-14 00:40:21.878-06 | 
+(3 rows)
+
+These results prove that the uuidv7() UUIDs in the id column contain timestamp information, while
+the uuidv4() UUIDs in the public_id column do not. */
+
+/* 3. Show what the Go server would return to the client after insert
+
+HTTP/2 202
+date: Fri, 14 May 2026 00:01:15 GMT
+content-type: application/json
+content-length: 56
+{
+"job_id": "b31dedca-4c25-471d-8b13-128d77a24681"
+}
+
+Upon insert, the Go server would return the above JSON response that includes the public_id (job_id).
+The client can then use this job_id to poll for the job status. One thing to note is that the HTTP
+202 status code indicates that the request has been accepted for processing, but not yet completed. */
+
+/* 4. Show what the Go server would do when the client polls
+
+HTTP/2 200 
+date: Fri, 14 May 2026 00:02:31 GMT
+content-type: application/json
+content-length: 50
+{
+    "status": "processing",
+    "progress": 75
+}
+
+Upon polling, the Go server would return the above JSON response that includes the job status and
+progress. The HTTP 200 status code indicates that the job is OK and started processing. Please note,
+the status and progress columns are created and developed in the subsequent steps. */
