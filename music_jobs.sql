@@ -11,6 +11,11 @@ This preliminary phase removes all existing database contents, enabling this scr
 re-executed and modified iteratively using the \i music_jobs.sql command in psql.
 ==================================================================================== */
 
+DROP INDEX IF EXISTS idx_music_jobs_result_gin;
+DROP INDEX IF EXISTS idx_music_jobs_payload_gin;
+DROP INDEX IF EXISTS idx_music_jobs_status_created_at;
+DROP TRIGGER IF EXISTS music_jobs_updated_at_trigger ON music_jobs;
+DROP FUNCTION IF EXISTS set_updated_at();
 DROP TABLE IF EXISTS music_jobs;
 
 /* ====================================================================================
