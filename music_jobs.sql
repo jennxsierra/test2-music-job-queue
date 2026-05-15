@@ -553,3 +553,114 @@ WHERE status = 'done' LIMIT 1;
 --------------------------------------+-----------+--------+----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  a14ceb19-6096-4904-a513-bb97e67e20cb | Wadani Le | done   |      100 | {"trimmed_path": "/music/uploads/processsed/trimmed/102f09505b35f531f470b836d5612a45_trimmed.wav", "waveform_path": "/music/uploads/processsed/waveforms/102f09505b35f531f470b836d5612a45_waveform.json", "converted_path": "/music/uploads/processsed/converted/102f09505b35f531f470b836d5612a45_converted.mp3", "normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav"}
 (1 row) */
+
+/* ====================================================================================
+STEP 5 - updated_at
+==================================================================================== */
+
+ALTER TABLE music_jobs
+    ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+----- Q & A -----
+/* 1. Why is created_at not enough?
+created_at only tells us when the job was first created, but doesn't tell us when it was last updated.
+By adding updated_at, we can track the last time the job's status or progress was modified. This can
+be useful for tracking how long a job has been in progress or if it has stalled. */
+
+/* 2. What goes wrong if application code maintains updated_at?
+If application code is responsible for maintaining updated_at, there is a risk of human error or bugs
+that could lead to incorrect timestamps being recorded. For example, if a developer forgets to update
+the updated_at field after changing the job's status or progress, it could lead to confusion and
+inaccurate tracking of job updates. */
+
+/* 3. Write a query that would power an SSE health check endpoint
+SELECT public_id, status, progress, result, error_msg, updated_at
+FROM music_jobs WHERE public_id = $1 AND updated_at > $2;
+
+This query would allow the SSE health check endpoint to retrieve the latest status and progress of a
+specific job based on its public_id, while also ensuring that the information is up-to-date by
+filtering for records that have been updated after a certain timestamp ($2). */
+
+----- SAMPLE DATA -----
+
+-- Update a job's progress without setting updated_at manually
+/* BEFORE UPDATE:
+SELECT id, payload->>'title' AS title, status, progress, updated_at
+FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1;
+
+                  id                  |  title   | status  | progress |          updated_at           
+--------------------------------------+----------+---------+----------+-------------------------------
+ 019e296e-7a2e-77bb-ac08-1a4b044dace9 | Born Deh | pending |        0 | 2026-05-14 20:19:26.674747-06
+(1 row) */
+
+UPDATE music_jobs
+SET status = 'processing', progress = 25,
+result = result || jsonb_build_object(
+    'normalized_path', '/music/uploads/processsed/normalized/' || md5(payload->>'title') || '_normalized.wav'
+)
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1); -- updating the third job for testing
+
+/* AFTER UPDATE:
+SELECT id, payload->>'title' AS title, status, progress, updated_at
+FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1;
+
+                  id                  |  title   |   status   | progress |          updated_at           
+--------------------------------------+----------+------------+----------+-------------------------------
+ 019e296e-7a2e-77bb-ac08-1a4b044dace9 | Born Deh | processing |       25 | 2026-05-14 20:19:26.674747-06
+(1 row)
+
+Notice the updated_at timestamp has remained unchanged after the update and retains the stale data. */
+
+-- Update the same job with the correct updated_at value using now()
+UPDATE music_jobs
+SET progress = 50, updated_at = now(),
+result = result || jsonb_build_object(
+    'trimmed_path', '/music/uploads/processsed/trimmed/' || md5(payload->>'title') || '_trimmed.wav'
+)
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1);
+
+/* AFTER UPDATE WITH CORRECT updated_at:
+SELECT id, payload->>'title' AS title, status, progress, updated_at
+FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1;
+
+                  id                  |  title   |   status   | progress |          updated_at          
+--------------------------------------+----------+------------+----------+------------------------------
+ 019e296e-7a2e-77bb-ac08-1a4b044dace9 | Born Deh | processing |       50 | 2026-05-14 20:26:24.92658-06
+(1 row)
+
+Notice the updated_at timestamp has been correctly updated to reflect the latest change this time. */
+
+-- Explain why this is fragile
+/* This approach is fragile because it relies on the application code to manually update the updated_at
+field. If the application code forgets to update this field or updates it incorrectly, it can lead to
+inaccurate tracking of job updates. This can result in confusion and inaccurate reporting of job statuses. */
+
+----- VERIFICATION QUERIES -----
+
+/* 1. Find jobs that changed in the last 60 seconds 
+SELECT id, payload->>'title' AS title, status, progress, updated_at
+FROM music_jobs WHERE updated_at > now() - INTERVAL '60 seconds' ORDER BY updated_at DESC
+
+ id | title | status | progress | updated_at 
+----+-------+--------+----------+------------
+(0 rows)
+
+Note that no jobs have changed in the last 60 seconds. */
+
+/* 2. Find jobs stuck in processing for more than 5 minutes
+SELECT id, payload->>'title' AS title, status, progress, created_at, updated_at
+FROM music_jobs WHERE status = 'processing' AND updated_at < now() - INTERVAL '5 minutes';
+
+                  id                  |  title   |   status   | progress |          created_at          |          updated_at          
+--------------------------------------+----------+------------+----------+------------------------------+------------------------------
+ 019e296e-7a2e-77bb-ac08-1a4b044dace9 | Born Deh | processing |       50 | 2026-05-14 20:19:26.63836-06 | 2026-05-14 20:26:24.92658-06
+(1 row) */
+
+/* 3. How long did each completed job take?
+SELECT id, payload->>'title' AS title, status, progress, updated_at - created_at AS job_duration
+FROM music_jobs WHERE status = 'done';
+
+                  id                  |   title   | status | progress |  job_duration  
+--------------------------------------+-----------+--------+----------+----------------
+ 019e296e-724c-7a3c-9ebc-a01e6fe775a1 | Wadani Le | done   |      100 | 00:00:02.05437
+(1 row) */
