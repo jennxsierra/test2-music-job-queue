@@ -382,3 +382,174 @@ SELECT id, payload->>'title' AS title, status, progress, created_at FROM music_j
  019e2887-b98d-78f8-a533-e8537001f6bc | Good Mawnin Belize | processing |       25 | 2026-05-14 16:07:24.04539-06
  019e2887-bd83-7862-9312-4116f23aa216 | Born Deh           | pending    |        0 | 2026-05-14 16:07:25.059356-06
 (3 rows) */
+
+/* ====================================================================================
+STEP 4 - result, error_msg
+==================================================================================== */
+
+ALTER TABLE music_jobs
+    ADD COLUMN result JSONB NOT NULL DEFAULT '{}'::JSONB,
+    ADD COLUMN error_msg TEXT;
+
+----- Q & A -----
+/* 1. Why does the result default to '{}' and not NULL?
+Defaulting the result column to '{}' ensures that it always contains a valid JSONB object, even if no
+result data is available. This allows for consistent handling of the result field in application code,
+as it can always expect a JSON object rather than having to check for NULL values. Additionally, using
+an empty JSON object as the default value can simplify queries and updates that interact with the result
+column, as it eliminates the need for special handling of NULL cases. In contrast, if the default were NULL,
+application code would need to include additional logic to handle potential NULL values, which can lead to
+more complex and error-prone code. */
+
+/* 2. Why is error_msg TEXT and not inside the result JSONB? 
+error_msg is stored as a separate column because it represents a distinct piece of information from the
+result. While the result JSONB contains the output of the job, error_msg specifically captures any
+errors that occurred during the job execution. This separation allows for clearer data organization and
+easier querying of error conditions without having to parse through the result JSONB field. */
+
+/* 3. What does the || operator do to a JSONB object?
+The merge (||) operator in PostgreSQL is used to concatenate two JSONB objects. When applied, it merges the
+key-value pairs of both JSONB objects. If there are duplicate keys, the values from the right-hand operand
+will overwrite those from the left-hand operand. This operator allows for easy combination of JSONB data,
+making it useful for updating or augmenting existing JSONB fields with new information. */
+
+/* 4. Why does each stage read from the original file, not the previous stage's output?
+Each stage reads from the original file rather than the previous stage's output to ensure data integrity
+and avoid compounding errors. If each stage were to read from the previous stage's output, any errors or
+issues that arise in one stage could be propagated and amplified in subsequent stages, making it more
+difficult to identify and troubleshoot problems. Additionally, by always reading from the original file,
+each stage can operate independently, allowing for better error isolation, easier debugging, and the
+ability to be processed in parallel. */
+
+----- SAMPLE DATA -----
+
+-- STAGE 1: Normalize
+UPDATE music_jobs
+SET status = 'processing', progress = 25,
+result = result || jsonb_build_object(
+    'normalized_path', '/music/uploads/processsed/normalized/' || md5(payload->>'title') || '_normalized.wav'
+)
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+/* SELECT payload->>'title' AS title, status, progress, result
+   FROM music_jobs WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+   title   |   status   | progress |                                              result                                              
+-----------+------------+----------+--------------------------------------------------------------------------------------------------
+ Wadani Le | processing |       25 | {"normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav"}
+(1 row) */
+
+-- STAGE 2: Trim Silence
+UPDATE music_jobs
+SET progress = 50,
+result = result || jsonb_build_object(
+    'trimmed_path', '/music/uploads/processsed/trimmed/' || md5(payload->>'title') || '_trimmed.wav'
+)
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+/* SELECT payload->>'title' AS title, status, progress, result
+   FROM music_jobs WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+   title   |   status   | progress |                                                                                                    result                                                                                                     
+-----------+------------+----------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Wadani Le | processing |       50 | {"trimmed_path": "/music/uploads/processsed/trimmed/102f09505b35f531f470b836d5612a45_trimmed.wav", "normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav"}
+(1 row) */
+
+-- STAGE 3: Convert Format
+UPDATE music_jobs
+SET progress = 75,
+result = result || jsonb_build_object(
+    'converted_path', '/music/uploads/processsed/converted/' || md5(payload->>'title') || '_converted.mp3'
+)
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+/* SELECT payload->>'title' AS title, status, progress, result
+   FROM music_jobs WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+   title   |   status   | progress |                                                                                                                                                        result                                                                                                                                                         
+-----------+------------+----------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Wadani Le | processing |       75 | {"trimmed_path": "/music/uploads/processsed/trimmed/102f09505b35f531f470b836d5612a45_trimmed.wav", "converted_path": "/music/uploads/processsed/converted/102f09505b35f531f470b836d5612a45_converted.mp3", "normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav"}
+(1 row) */
+
+-- STAGE 4: Waveform Generation
+UPDATE music_jobs
+SET status = 'done', progress = 100,
+result = result || jsonb_build_object(
+    'waveform_path', '/music/uploads/processsed/waveforms/' || md5(payload->>'title') || '_waveform.json'
+)
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+/* SELECT payload->>'title' AS title, status, progress, result
+   FROM music_jobs WHERE id = (SELECT id FROM music_jobs ORDER BY created_at LIMIT 1);
+
+   title   | status | progress |                                                                                                                                                                                                            result                                                                                                                                                                                                            
+-----------+--------+----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Wadani Le | done   |      100 | {"trimmed_path": "/music/uploads/processsed/trimmed/102f09505b35f531f470b836d5612a45_trimmed.wav", "waveform_path": "/music/uploads/processsed/waveforms/102f09505b35f531f470b836d5612a45_waveform.json", "converted_path": "/music/uploads/processsed/converted/102f09505b35f531f470b836d5612a45_converted.mp3", "normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav"}
+(1 row) */
+
+-- Simulate a failure in the next job by updating its status to failed and adding an error message
+UPDATE music_jobs
+SET status = 'failed', progress = 50, error_msg = 'Failed to trim silence due to invalid audio format'
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at OFFSET 1 LIMIT 1);
+
+/* SELECT payload->>'title' AS title, status, progress, error_msg
+   FROM music_jobs WHERE id = (SELECT id FROM music_jobs ORDER BY created_at OFFSET 1 LIMIT 1);
+
+       title        | status | progress |                         error_msg                         
+--------------------+--------+----------+-----------------------------------------------------
+ Good Mawnin Belize | failed |       50 | Failed to trim silence due to invalid audio format
+(1 row) */
+
+----- VERIFICATION QUERIES -----
+
+/* 1. What does the client see when polling a completed job?
+The client would see a JSON response similar to the following when polling a completed job:
+
+HTTP/2 200 
+date: Thu, 14 May 2026 00:05:47 GMT
+content-type: application/json
+content-length: 600
+{
+    "status": "done",
+    "progress": 100,
+    "result": {
+        "trimmed_path": "/music/uploads/processsed/trimmed/102f09505b35f531f470b836d5612a45_trimmed.wav",
+        "waveform_path": "/music/uploads/processsed/waveforms/102f09505b35f531f470b836d5612a45_waveform.json",
+        "converted_path": "/music/uploads/processsed/converted/102f09505b35f531f470b836d5612a45_converted.mp3",
+        "normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav"
+    }
+} */
+
+/* 2. What does the client see mid-processing (partial result)? 
+HTTP/2 200
+date: Thu, 14 May 2026 00:05:31 GMT
+content-type: application/json
+content-length: 362
+{
+    "status": "processing",
+    "progress": 50,
+    "result": {
+        "trimmed_path": "/music/uploads/processsed/trimmed/102f09505b35f531f470b836d5612a45_trimmed.wav",
+        "normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav",
+    }
+}
+
+This would be assuming that each stage is stored as a separate component within the result object that
+the client can access while the job is in progress. */
+
+/* 3. How do you find all failed jobs? 
+SELECT id, payload->>'title' AS title, status, progress FROM music_jobs WHERE status = 'failed';
+
+                  id                  |       title        | status | progress 
+--------------------------------------+--------------------+--------+----------
+ 019e2935-095c-7ca2-ae54-4cc6ad8655b0 | Good Mawnin Belize | failed |       50
+(1 row) */
+
+/* 4. Show the full result object for a completed job 
+SELECT public_id, payload->>'title' AS title, status, progress, result FROM music_jobs
+WHERE status = 'done' LIMIT 1;
+
+              public_id               |   title   | status | progress |                                                                                                                                                                                                            result                                                                                                                                                                                                   
+--------------------------------------+-----------+--------+----------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ a14ceb19-6096-4904-a513-bb97e67e20cb | Wadani Le | done   |      100 | {"trimmed_path": "/music/uploads/processsed/trimmed/102f09505b35f531f470b836d5612a45_trimmed.wav", "waveform_path": "/music/uploads/processsed/waveforms/102f09505b35f531f470b836d5612a45_waveform.json", "converted_path": "/music/uploads/processsed/converted/102f09505b35f531f470b836d5612a45_converted.mp3", "normalized_path": "/music/uploads/processsed/normalized/102f09505b35f531f470b836d5612a45_normalized.wav"}
+(1 row) */
