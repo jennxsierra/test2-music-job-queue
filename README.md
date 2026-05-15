@@ -10,7 +10,7 @@
 
 ## Youtube Video Demonstration
 
-Link:
+Link: https://youtu.be/KkpXy8a5EsY
 
 ## Database Setup
 
