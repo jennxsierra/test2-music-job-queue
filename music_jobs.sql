@@ -392,6 +392,7 @@ ALTER TABLE music_jobs
     ADD COLUMN error_msg TEXT;
 
 ----- Q & A -----
+
 /* 1. Why does the result default to '{}' and not NULL?
 Defaulting the result column to '{}' ensures that it always contains a valid JSONB object, even if no
 result data is available. This allows for consistent handling of the result field in application code,
@@ -562,6 +563,7 @@ ALTER TABLE music_jobs
     ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 ----- Q & A -----
+
 /* 1. Why is created_at not enough?
 created_at only tells us when the job was first created, but doesn't tell us when it was last updated.
 By adding updated_at, we can track the last time the job's status or progress was modified. This can
@@ -663,4 +665,129 @@ FROM music_jobs WHERE status = 'done';
                   id                  |   title   | status | progress |  job_duration  
 --------------------------------------+-----------+--------+----------+----------------
  019e296e-724c-7a3c-9ebc-a01e6fe775a1 | Wadani Le | done   |      100 | 00:00:02.05437
+(1 row) */
+
+/* ====================================================================================
+STEP 6 - Trigger on updated_at
+==================================================================================== */
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER music_jobs_updated_at_trigger
+    BEFORE UPDATE ON music_jobs
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+----- Q & A -----
+
+/* 1. Why BEFORE UPDATE and not AFTER UPDATE?
+Using BEFORE UPDATE allows us to modify the NEW record before it is written to the database. This means
+that we can set the updated_at field to the current timestamp right before the update occurs, ensuring 
+that it always reflects the most recent change. If we were to use AFTER UPDATE, the trigger would execute
+after the record has already been updated, which would not allow us to modify the updated_at field for
+that update operation. */
+
+/* 2. What is NEW and what is OLD in a trigger function?
+In a trigger function, NEW and OLD are special record variables that represent the state of the row being
+updated. NEW contains the new values that will be written to the database after the update, while OLD
+contains the original values of the row before the update. */
+
+/* 3. Why does returning NEW matter?
+Returning NEW in a BEFORE UPDATE trigger is important because it allows the modified record to be saved
+to the database. If we were to return NULL or not return anything, the update operation would be aborted,
+and the changes would not be applied to the database. By returning NEW, we ensure that the updated record
+is properly saved with the new updated_at timestamp. */
+
+/* 4. Why is the function reusable across tables? 
+The set_updated_at() function is reusable across tables because it is defined as a generic trigger function
+that can be applied to any table with an updated_at column. The function does not reference any specific
+table or column names, allowing it to be easily reused by simply creating a trigger on the desired table
+that calls this function. */
+
+----- SAMPLE DATA -----
+
+-- Update a job's progress without setting updated_at manually to test the trigger
+/* BEFORE UPDATE:
+SELECT id, payload->>'title' AS title, status, progress, updated_at
+FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1;
+
+                  id                  |  title   |   status   | progress |          updated_at          
+--------------------------------------+----------+------------+----------+------------------------------
+ 019e296e-7a2e-77bb-ac08-1a4b044dace9 | Born Deh | processing |       50 | 2026-05-14 20:26:24.92658-06
+(1 row) */
+
+UPDATE music_jobs
+SET progress = 75, -- not setting updated_at manually to test the trigger
+result = result || jsonb_build_object(
+    'converted_path', '/music/uploads/processsed/converted/' || md5(payload->>'title') || '_converted.mp3'
+)
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1);
+
+/* AFTER UPDATE:
+SELECT id, payload->>'title' AS title, status, progress, updated_at
+FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1;
+
+                  id                  |  title   |   status   | progress |          updated_at           
+--------------------------------------+----------+------------+----------+-------------------------------
+ 019e296e-7a2e-77bb-ac08-1a4b044dace9 | Born Deh | processing |       75 | 2026-05-14 21:04:46.816745-06
+(1 row)
+
+Notice that the updated_at field has been automatically updated to reflect the latest change, even though
+it was not set manually. */
+
+-- Attempt to sabotage the trigger by setting updated_at to a specific value in the update statement
+UPDATE music_jobs
+SET updated_at = '2000-01-01'
+WHERE id = (SELECT id FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1);
+
+/* AFTER UPDATE ATTEMPTING TO SABOTAGE THE TRIGGER:
+SELECT id, payload->>'title' AS title, status, progress, updated_at
+FROM music_jobs ORDER BY created_at OFFSET 2 LIMIT 1;
+
+                  id                  |  title   |   status   | progress |          updated_at           
+--------------------------------------+----------+------------+----------+-------------------------------
+ 019e296e-7a2e-77bb-ac08-1a4b044dace9 | Born Deh | processing |       75 | 2026-05-14 21:08:19.867298-06
+(1 row)
+
+Notice how the updated_at field did not become 2000-01-01, but instead was automatically updated to the
+current timestamp by the trigger. */
+
+-- Verify the trigger exists using information_schema
+
+/* SELECT trigger_name, event_manipulation, action_timing, action_statement
+FROM information_schema.triggers WHERE event_object_table = 'music_jobs';
+
+         trigger_name          | event_manipulation | action_timing |         action_statement          
+-------------------------------+--------------------+---------------+-----------------------------------
+ music_jobs_updated_at_trigger | UPDATE             | BEFORE        | EXECUTE FUNCTION set_updated_at()
+(1 row) */
+
+----- VERIFICATION QUERIES -----
+
+/* 1. Show trigger details from information_schema.triggers
+SELECT trigger_name, event_object_table, event_manipulation, action_timing, action_statement
+FROM information_schema.triggers WHERE event_object_table = 'music_jobs';
+
+         trigger_name          | event_object_table | event_manipulation | action_timing |         action_statement          
+-------------------------------+--------------------+--------------------+---------------+-----------------------------------
+ music_jobs_updated_at_trigger | music_jobs         | UPDATE             | BEFORE        | EXECUTE FUNCTION set_updated_at()
+(1 row) */
+
+/* 2. Show function details from information_schema.routines
+SELECT routine_name, routine_definition, routine_type, data_type
+FROM information_schema.routines WHERE routine_name = 'set_updated_at';
+
+  routine_name  |     routine_definition      | routine_type | data_type 
+----------------+-----------------------------+--------------+-----------
+ set_updated_at |                            +| FUNCTION     | trigger
+                | BEGIN                      +|              | 
+                |     NEW.updated_at = now();+|              | 
+                |     RETURN NEW;            +|              | 
+                | END;                       +|              | 
+                |                             |              | 
 (1 row) */
