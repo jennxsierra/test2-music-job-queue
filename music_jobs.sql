@@ -791,3 +791,363 @@ FROM information_schema.routines WHERE routine_name = 'set_updated_at';
                 | END;                       +|              | 
                 |                             |              | 
 (1 row) */
+
+/* ====================================================================================
+STEP 7 - Indexes + EXPLAIN ANALYZE
+==================================================================================== */
+
+-- PART A — Generate 50,000 Rows of Sample Data (Guaranteed Distribution)
+
+INSERT INTO music_jobs (
+    payload,
+    status,
+    progress,
+    result,
+    error_msg
+)
+SELECT
+    -- Build realistic audio upload metadata for each generated job.
+    jsonb_build_object(
+        'filename',
+            CASE
+                WHEN i % 4 = 0 THEN 'belize_punta_mix_' || i || '.mp3'
+                WHEN i % 4 = 1 THEN 'garifuna_drums_' || i || '.wav'
+                WHEN i % 4 = 2 THEN 'brukdown_session_' || i || '.mp3'
+                ELSE 'marimba_recording_' || i || '.wav'
+            END,
+
+        'storage_path',
+            CASE
+                WHEN i % 4 IN (0, 2) THEN '/music/uploads/audio_' || i || '.mp3'
+                ELSE '/music/uploads/audio_' || i || '.wav'
+            END,
+
+        'file_size',
+            3000000 + (i * 37),
+
+        'mime_type',
+            CASE
+                WHEN i % 4 IN (0, 2) THEN 'audio/mpeg'
+                ELSE 'audio/wav'
+            END,
+
+        'title',
+            CASE
+                WHEN i % 4 = 0 THEN 'Punta Rock Demo ' || i
+                WHEN i % 4 = 1 THEN 'Garifuna Drum Session ' || i
+                WHEN i % 4 = 2 THEN 'Belize Brukdown Track ' || i
+                ELSE 'Marimba Recording ' || i
+            END,
+
+        'artist',
+            CASE
+                WHEN i % 4 = 0 THEN 'Supa G'
+                WHEN i % 4 = 1 THEN 'Garifuna Collective'
+                WHEN i % 4 = 2 THEN 'Leela Vernon Tribute Band'
+                ELSE 'Benque Marimba Group'
+            END,
+
+        'genre',
+            CASE
+                WHEN i % 4 = 0 THEN 'Punta Rock'
+                WHEN i % 4 = 1 THEN 'Garifuna'
+                WHEN i % 4 = 2 THEN 'Brukdown'
+                ELSE 'Marimba'
+            END,
+
+        'duration',
+            120 + (i % 240)
+    ) AS payload,
+
+    -- Assign job statuses evenly using modulo.
+    CASE
+        WHEN i % 4 = 0 THEN 'pending'
+        WHEN i % 4 = 1 THEN 'processing'
+        WHEN i % 4 = 2 THEN 'done'
+        ELSE 'failed'
+    END AS status,
+
+    -- Match progress values to the job status.
+    CASE
+        WHEN i % 4 = 0 THEN 0
+        WHEN i % 4 = 1 THEN 50
+        WHEN i % 4 = 2 THEN 100
+        ELSE 75
+    END AS progress,
+
+    -- Store partial or complete processing results depending on status.
+    CASE
+        WHEN i % 4 = 2 THEN
+            jsonb_build_object(
+                'normalized_path', '/music/processed/normalized/audio_' || i || '.wav',
+                'trimmed_path', '/music/processed/trimmed/audio_' || i || '.wav',
+                'converted_path', '/music/processed/converted/audio_' || i || '.mp3',
+                'waveform_path', '/music/processed/waveforms/audio_' || i || '.json'
+            )
+        WHEN i % 4 = 1 THEN
+            jsonb_build_object(
+                'normalized_path', '/music/processed/normalized/audio_' || i || '.wav',
+                'trimmed_path', '/music/processed/trimmed/audio_' || i || '.wav'
+            )
+        ELSE '{}'::jsonb
+    END AS result,
+
+    -- Failed jobs get a generic stage failure message.
+    CASE
+        WHEN i % 4 = 3 THEN
+            'Failed at stage ' ||
+            CASE
+                WHEN i % 3 = 0 THEN 'normalize'
+                WHEN i % 3 = 1 THEN 'trim silence'
+                ELSE 'convert'
+            END
+        ELSE NULL
+    END AS error_msg
+
+FROM generate_series(1, 50000) AS s(i);
+
+-- PART B: Run EXPLAIN ANALYZE Before Indexes
+
+/* Query 1: Worker Poll
+
+EXPLAIN ANALYZE
+SELECT id, payload FROM music_jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1;
+
+                                                           QUERY PLAN                                                           
+--------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=3812.25..3812.25 rows=1 width=293) (actual time=12.549..12.551 rows=1.00 loops=1)
+   Buffers: shared hit=3128
+   ->  Sort  (cost=3812.25..3843.35 rows=12442 width=293) (actual time=12.547..12.548 rows=1.00 loops=1)
+         Sort Key: created_at
+         Sort Method: top-N heapsort  Memory: 25kB
+         Buffers: shared hit=3128
+         ->  Seq Scan on music_jobs  (cost=0.00..3750.04 rows=12442 width=293) (actual time=0.021..9.860 rows=12500.00 loops=1)
+               Filter: (status = 'pending'::text)
+               Rows Removed by Filter: 37503
+               Buffers: shared hit=3125
+ Planning:
+   Buffers: shared hit=32
+ Planning Time: 0.286 ms
+ Execution Time: 12.580 ms
+(14 rows) */
+
+/* Query 2: Client Poll
+
+EXPLAIN ANALYZE
+SELECT public_id, status, progress, result, error_msg FROM music_jobs
+WHERE public_id = (SELECT public_id FROM music_jobs LIMIT 1);
+
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using music_jobs_public_id_key on music_jobs  (cost=0.36..8.38 rows=1 width=154) (actual time=0.083..0.088 rows=1.00 loops=1)
+   Index Cond: (public_id = (InitPlan 1).col1)
+   Index Searches: 1
+   Buffers: shared hit=5
+   InitPlan 1
+     ->  Limit  (cost=0.00..0.07 rows=1 width=16) (actual time=0.034..0.035 rows=1.00 loops=1)
+           Buffers: shared hit=2
+           ->  Seq Scan on music_jobs music_jobs_1  (cost=0.00..3625.03 rows=50003 width=16) (actual time=0.032..0.033 rows=1.00 loops=1)
+                 Buffers: shared hit=2
+ Planning Time: 0.261 ms
+ Execution Time: 0.133 ms
+(11 rows) */
+
+/* Query 3: JSONB Containment
+
+EXPLAIN ANALYZE
+SELECT id, payload->>'filename' FROM music_jobs
+WHERE payload @> '{"mime_type": "audio/mpeg"}'::jsonb;
+
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Seq Scan on music_jobs  (cost=0.00..3810.65 rows=24244 width=48) (actual time=0.032..18.563 rows=25002.00 loops=1)
+   Filter: (payload @> '{"mime_type": "audio/mpeg"}'::jsonb)
+   Rows Removed by Filter: 25001
+   Buffers: shared hit=3125
+ Planning Time: 0.229 ms
+ Execution Time: 19.778 ms
+(6 rows) */
+
+-- PART C: Create Indexes
+
+-- Index for the worker poll query:
+CREATE INDEX idx_music_jobs_status_created_at
+ON music_jobs (status, created_at);
+
+-- Index for JSONB containment queries on payload:
+CREATE INDEX idx_music_jobs_payload_gin
+ON music_jobs USING GIN (payload);
+
+-- Index for JSONB containment queries on result:
+CREATE INDEX idx_music_jobs_result_gin
+ON music_jobs USING GIN (result);
+
+-- PART D: Run EXPLAIN ANALYZE After Indexes
+
+/* Query 1: Worker Poll
+
+EXPLAIN ANALYZE
+SELECT id, payload FROM music_jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1;
+
+                                                                           QUERY PLAN                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.29..1.28 rows=1 width=293) (actual time=0.086..0.087 rows=1.00 loops=1)
+   Buffers: shared hit=1 read=2
+   ->  Index Scan using idx_music_jobs_status_created_at on music_jobs  (cost=0.29..12370.40 rows=12442 width=293) (actual time=0.085..0.085 rows=1.00 loops=1)
+         Index Cond: (status = 'pending'::text)
+         Index Searches: 1
+         Buffers: shared hit=1 read=2
+ Planning:
+   Buffers: shared hit=48 read=1 dirtied=2
+ Planning Time: 0.605 ms
+ Execution Time: 0.256 ms
+(10 rows) */
+
+/* Query 2: Client Poll
+
+EXPLAIN ANALYZE
+SELECT public_id, status, progress, result, error_msg FROM music_jobs
+WHERE public_id = (SELECT public_id FROM music_jobs LIMIT 1);
+
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using music_jobs_public_id_key on music_jobs  (cost=0.36..8.38 rows=1 width=154) (actual time=0.053..0.056 rows=1.00 loops=1)
+   Index Cond: (public_id = (InitPlan 1).col1)
+   Index Searches: 1
+   Buffers: shared hit=5
+   InitPlan 1
+     ->  Limit  (cost=0.00..0.07 rows=1 width=16) (actual time=0.019..0.020 rows=1.00 loops=1)
+           Buffers: shared hit=2
+           ->  Seq Scan on music_jobs music_jobs_1  (cost=0.00..3625.03 rows=50003 width=16) (actual time=0.018..0.018 rows=1.00 loops=1)
+                 Buffers: shared hit=2
+ Planning Time: 0.213 ms
+ Execution Time: 0.091 ms
+(11 rows) */
+
+/* Query 3: JSONB Containment
+
+EXPLAIN ANALYZE
+SELECT id, payload->>'filename' FROM music_jobs
+WHERE payload @> '{"mime_type": "audio/mpeg"}'::jsonb;
+
+                                                                   QUERY PLAN                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on music_jobs  (cost=190.34..3679.00 rows=24244 width=48) (actual time=7.059..18.232 rows=25002.00 loops=1)
+   Recheck Cond: (payload @> '{"mime_type": "audio/mpeg"}'::jsonb)
+   Heap Blocks: exact=3125
+   Buffers: shared hit=3150
+   ->  Bitmap Index Scan on idx_music_jobs_payload_gin  (cost=0.00..184.28 rows=24244 width=0) (actual time=5.978..5.979 rows=25002.00 loops=1)
+         Index Cond: (payload @> '{"mime_type": "audio/mpeg"}'::jsonb)
+         Index Searches: 1
+         Buffers: shared hit=25
+ Planning:
+   Buffers: shared hit=1
+ Planning Time: 0.241 ms
+ Execution Time: 19.272 ms
+(12 rows) */
+
+-- PART E: Explain the Results
+
+/* Query 1 performed a sequential scan before the index was created, which took significantly longer (12.580 ms) compared to
+after the index was created (0.256 ms). The index allowed the database to quickly locate the relevant rows based on the status
+and created_at fields, resulting in a much faster query execution time.
+
+Query 2 performed an index scan both before and after the indexes were created, but the execution time improved slightly from
+0.133 ms to 0.091 ms. This is because the query was already efficient due to the existing index on public_id, but the slight
+improvement could be attributed to better caching and overall database performance after the additional indexes were created.
+
+Query 3 showed a slight improvement after the GIN index on the payload column was created. Before the index, it performed
+a sequential scan that took 19.778 ms, while after the index it performed a bitmap index scan followed by a bitmap heap scan
+that took 19.272 ms. The GIN index allowed the database to efficiently filter rows based on the JSONB containment condition,
+resulting in a faster query execution time. For this query, PostgreSQL decided to use the GIN index for better performance
+since { "mime_type": "audio/mpeg" } makes up less than half of the JSONB objects in the payload column. */
+
+----- Q & A -----
+
+/* 1. What is a sequential scan and why is it slow at scale?
+A sequential scan is a type of query execution plan where the database reads through every row in the table to find matches
+for the query conditions. This can be slow at scale because as the number of rows increases, the time it takes to read through
+all the data also increases, leading to longer query execution times. Sequential scans are inefficient for large datasets when
+only a small subset of rows match the query conditions. */
+
+/* 2. Why does the worker poll query need a COMPOSITE index and not just an index on status alone?
+The worker poll query needs a composite index on (status, created_at) because it filters by status and then orders the results
+by created_at. An index on status alone would not be sufficient to efficiently retrieve the rows in the correct order, as the
+database would still need to sort the results after filtering by status. The composite index allows the database to quickly
+locate the relevant rows based on both the status and the created_at timestamp, resulting in faster query execution. */
+
+/* 3. Why GIN and not btree for JSONB columns?
+GIN (Generalized Inverted Index) is specifically designed for indexing complex data types like JSONB, allowing for efficient
+querying of nested structures and containment operations. Btree indexes are not suitable for JSONB columns because they are
+optimized for simple scalar values and do not support the types of queries commonly performed on JSONB data, such as checking
+for the presence of specific keys or values within the JSON structure. GIN indexes provide better performance for these types
+of queries, making them the preferred choice for indexing JSONB columns. */
+
+/* 4. Which operators USE the GIN index? Which do NOT?
+The GIN index is used for operators that involve containment and existence checks on JSONB data, such as:
+- @> (contains)
+- <@ (is contained by)
+- ? (key exists)
+- ?& (all keys exist)
+- ?| (any key exists)
+Operators that do NOT use the GIN index include:
+- = (equality)
+- != (inequality)
+- <, >, <=, >= (comparison operators)
+- IS NULL / IS NOT NULL
+These operators typically require a different type of index or may result in a sequential scan if no suitable index is available. */
+
+/* 5. What speedup did you measure? Show the before/after execution times.
+Query 1 (Worker Poll):
+Before Index: 12.580 ms
+After Index: 0.256 ms
+Speedup: 12.324 ms
+
+Query 2 (Client Poll):
+Before Index: 0.133 ms
+After Index: 0.091 ms
+Speedup: 0.042 ms
+
+Query 3 (JSONB Containment):
+Before GIN Index: 19.778 ms
+After GIN Index: 19.272 ms
+Speedup: 0.506 ms */
+
+----- FINAL VERIFICATION ------
+
+/* SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'music_jobs' ORDER BY indexname;
+
+            indexname             |                                              indexdef                                               
+----------------------------------+-----------------------------------------------------------------------------------------------------
+ idx_music_jobs_payload_gin       | CREATE INDEX idx_music_jobs_payload_gin ON public.music_jobs USING gin (payload)
+ idx_music_jobs_result_gin        | CREATE INDEX idx_music_jobs_result_gin ON public.music_jobs USING gin (result)
+ idx_music_jobs_status_created_at | CREATE INDEX idx_music_jobs_status_created_at ON public.music_jobs USING btree (status, created_at)
+ music_jobs_pkey                  | CREATE UNIQUE INDEX music_jobs_pkey ON public.music_jobs USING btree (id)
+ music_jobs_public_id_key         | CREATE UNIQUE INDEX music_jobs_public_id_key ON public.music_jobs USING btree (public_id)
+(5 rows)
+
+\d music_jobs
+
+                           Table "public.music_jobs"
+   Column   |           Type           | Collation | Nullable |     Default     
+------------+--------------------------+-----------+----------+-----------------
+ id         | uuid                     |           | not null | uuidv7()
+ payload    | jsonb                    |           | not null | 
+ created_at | timestamp with time zone |           | not null | now()
+ public_id  | uuid                     |           | not null | uuidv4()
+ status     | text                     |           | not null | 'pending'::text
+ progress   | integer                  |           | not null | 0
+ result     | jsonb                    |           | not null | '{}'::jsonb
+ error_msg  | text                     |           |          | 
+ updated_at | timestamp with time zone |           | not null | now()
+Indexes:
+    "music_jobs_pkey" PRIMARY KEY, btree (id)
+    "idx_music_jobs_payload_gin" gin (payload)
+    "idx_music_jobs_result_gin" gin (result)
+    "idx_music_jobs_status_created_at" btree (status, created_at)
+    "music_jobs_public_id_key" UNIQUE CONSTRAINT, btree (public_id)
+Check constraints:
+    "music_jobs_progress_check" CHECK (progress >= 0 AND progress <= 100)
+    "music_jobs_status_check" CHECK (status = ANY (ARRAY['pending'::text, 'processing'::text, 'done'::text, 'failed'::text]))
+Triggers:
+    music_jobs_updated_at_trigger BEFORE UPDATE ON music_jobs FOR EACH ROW EXECUTE FUNCTION set_updated_at() */
